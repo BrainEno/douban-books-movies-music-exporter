@@ -1,0 +1,919 @@
+// ==UserScript==
+// @name         豆瓣读书商品导入版（导出 ProductModel JSON + 表单对齐 CSV）
+// @namespace    https://chat.openai.com/
+// @version      1.0.0
+// @description  从豆瓣读过/想读列表抓取图书详情，导出可用于图书管理系统导入的 JSON 和 CSV
+// @author       OpenAI
+// @match        https://book.douban.com/people/*/collect*
+// @match        https://book.douban.com/people/*/wish*
+// @match        https://www.douban.com/people/*
+// @require      https://cdn.jsdelivr.net/gh/zh-lx/pinyin-pro@latest/dist/pinyin-pro.js
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const EXPORT_FLAG = 'export_product_import=1';
+  const STORAGE_PREFIX = 'douban_book_product_import';
+  const RATE_LIMIT_MS = 900;
+  const RETRY_TIMES = 2;
+  const DEFAULT_OPERATOR = 'douban-import-script';
+  const DEFAULT_STOCK_UNIT = '册';
+  const DEFAULT_OPTION = '不区分';
+
+  function qs(selector, root = document) {
+    return root.querySelector(selector);
+  }
+
+  function qsa(selector, root = document) {
+    return Array.from(root.querySelectorAll(selector));
+  }
+
+  function normalizeText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function isHomepage() {
+    return location.hostname === 'www.douban.com' && /^\/people\/[^/]+\/?$/.test(location.pathname);
+  }
+
+  function isBookListPage() {
+    return location.hostname === 'book.douban.com' && /^\/people\/[^/]+\/(collect|wish)/.test(location.pathname);
+  }
+
+  function isExportMode() {
+    return new URLSearchParams(location.search).get('export_product_import') === '1';
+  }
+
+  function isWishMode() {
+    return location.pathname.includes('/wish');
+  }
+
+  function getPeopleIdFromUrl() {
+    const match = location.pathname.match(/\/people\/([^/]+)\//);
+    return match ? match[1] : '';
+  }
+
+  function getCurrentStart() {
+    const params = new URLSearchParams(location.search);
+    return Number(params.get('start') || '0');
+  }
+
+  function extractSubjectId(link) {
+    const match = String(link || '').match(/subject\/(\d+)\//);
+    return match ? match[1] : '';
+  }
+
+  function buildBookExportUrl(people, isWish) {
+    const mode = isWish ? 'wish' : 'collect';
+    return `https://book.douban.com/people/${people}/${mode}?start=0&sort=time&rating=all&filter=all&mode=list&${EXPORT_FLAG}`;
+  }
+
+  function createFloatingPanel() {
+    let panel = document.getElementById('douban-book-product-import-panel');
+    if (panel) {
+      return panel;
+    }
+
+    panel = document.createElement('div');
+    panel.id = 'douban-book-product-import-panel';
+    panel.style.cssText = [
+      'position:fixed',
+      'right:20px',
+      'bottom:20px',
+      'z-index:999999',
+      'background:#fff',
+      'border:1px solid #d9d9d9',
+      'border-radius:10px',
+      'box-shadow:0 8px 24px rgba(0,0,0,.15)',
+      'padding:12px',
+      'width:270px',
+      'font-size:13px',
+      'line-height:1.5',
+      'color:#333'
+    ].join(';');
+
+    document.body.appendChild(panel);
+    return panel;
+  }
+
+  function injectLauncherPanel() {
+    const people = getPeopleIdFromUrl();
+    if (!people) {
+      return;
+    }
+
+    const panel = createFloatingPanel();
+    panel.innerHTML = `
+      <div style="font-weight:700;margin-bottom:8px;">豆瓣读书商品导入版</div>
+      <div style="color:#666;margin-bottom:10px;">
+        自动抓取 ISBN、出版社、定价、装帧等字段，导出：
+        <br>1. ProductModel JSON
+        <br>2. 表单对齐 CSV
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <a href="${buildBookExportUrl(people, false)}"
+           style="display:block;text-align:center;background:#42bd56;color:#fff;text-decoration:none;padding:8px 10px;border-radius:6px;">
+          导出读过图书为导入文件
+        </a>
+        <a href="${buildBookExportUrl(people, true)}"
+           style="display:block;text-align:center;background:#2d8cf0;color:#fff;text-decoration:none;padding:8px 10px;border-radius:6px;">
+          导出想读图书为导入文件
+        </a>
+      </div>
+    `;
+  }
+
+  function ensureOverlay() {
+    let overlay = document.getElementById('douban-book-product-import-overlay');
+    if (overlay) {
+      return overlay;
+    }
+
+    overlay = document.createElement('div');
+    overlay.id = 'douban-book-product-import-overlay';
+    overlay.style.cssText = [
+      'position:fixed',
+      'right:20px',
+      'bottom:20px',
+      'z-index:1000000',
+      'width:340px',
+      'background:#fff',
+      'border:1px solid #d9d9d9',
+      'border-radius:12px',
+      'box-shadow:0 8px 24px rgba(0,0,0,.18)',
+      'padding:14px',
+      'font-size:13px',
+      'line-height:1.6',
+      'color:#333'
+    ].join(';');
+
+    overlay.innerHTML = `
+      <div style="font-weight:700;margin-bottom:8px;">豆瓣读书商品导入版</div>
+      <div id="douban-book-product-import-status" style="white-space:pre-wrap;color:#444;"></div>
+      <div id="douban-book-product-import-actions" style="margin-top:10px;"></div>
+    `;
+
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  function setOverlayStatus(message) {
+    const overlay = ensureOverlay();
+    const statusEl = qs('#douban-book-product-import-status', overlay);
+    if (statusEl) {
+      statusEl.textContent = message;
+    }
+  }
+
+  function setOverlayActions(html) {
+    const overlay = ensureOverlay();
+    const actionsEl = qs('#douban-book-product-import-actions', overlay);
+    if (actionsEl) {
+      actionsEl.innerHTML = html;
+    }
+  }
+
+  function getStorageKey(people, isWish) {
+    return `${STORAGE_PREFIX}:${people}:${isWish ? 'wish' : 'collect'}`;
+  }
+
+  function loadState(people, isWish) {
+    const raw = sessionStorage.getItem(getStorageKey(people, isWish));
+    if (!raw) {
+      return null;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      console.error('[豆瓣商品导入版] 读取状态失败：', error);
+      return null;
+    }
+  }
+
+  function saveState(people, isWish, state) {
+    sessionStorage.setItem(getStorageKey(people, isWish), JSON.stringify(state));
+  }
+
+  function clearState(people, isWish) {
+    sessionStorage.removeItem(getStorageKey(people, isWish));
+  }
+
+  function createNewState(people, isWish) {
+    return {
+      runId: `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+      people,
+      isWish,
+      createdAt: new Date().toISOString(),
+      items: [],
+      visitedStarts: [],
+    };
+  }
+
+  function parseListPageItems(isWish) {
+    const items = [];
+    const listItems = qsa('li.item');
+
+    listItems.forEach((li) => {
+      const titleAnchor =
+        qs('.title a', li) ||
+        qs('h2 a', li) ||
+        qs('a[href*="/subject/"]', li);
+
+      if (!titleAnchor) {
+        return;
+      }
+
+      const link = new URL(titleAnchor.getAttribute('href'), location.href).href;
+      const subjectId = extractSubjectId(link);
+
+      const item = {
+        title: normalizeText(titleAnchor.textContent),
+        link,
+        subject_id: subjectId,
+        rating: '',
+        rating_date: '',
+        comment: '',
+        release_date: '',
+        author: '',
+        publisher: '',
+        publish_year: '',
+        price: '',
+        price_value: '',
+        price_currency: '',
+        binding: '',
+        pages: '',
+        isbn: '',
+        translator: '',
+        subtitle: '',
+        original_title: '',
+        series: '',
+        edition: '',
+        fetch_status: 'pending',
+        fetch_error: '',
+      };
+
+      if (!isWish) {
+        const dateEl = qs('.date', li);
+        if (dateEl) {
+          const dateClone = dateEl.cloneNode(true);
+          const ratingSpan = qs('span', dateClone);
+          if (ratingSpan) {
+            const className = ratingSpan.getAttribute('class') || '';
+            const ratingMatch = className.match(/rating(\d)-t/);
+            item.rating = ratingMatch ? ratingMatch[1] : '';
+            ratingSpan.remove();
+          }
+          item.rating_date = normalizeText(dateClone.textContent).replaceAll('-', '/');
+        }
+
+        const commentEl = qs('.comment', li);
+        if (commentEl) {
+          item.comment = normalizeText(commentEl.textContent);
+        }
+      }
+
+      const introText = normalizeText((qs('.intro', li) || {}).textContent || '');
+      if (introText) {
+        const introParts = introText.split(' / ').map(normalizeText).filter(Boolean);
+        const dateReg = /\d{4}(?:-\d{1,2})?(?:-\d{1,2})?/;
+
+        if (introParts.length && !dateReg.test(introParts[0])) {
+          item.author = introParts[0];
+        }
+
+        const datePart = introParts.find((part) => dateReg.test(part));
+        if (datePart) {
+          item.release_date = datePart.replaceAll('-', '/');
+        }
+      }
+
+      items.push(item);
+    });
+
+    return items;
+  }
+
+  function parsePriceInfo(priceText) {
+    const result = {
+      price: priceText || '',
+      price_value: '',
+      price_currency: '',
+    };
+
+    if (!priceText) {
+      return result;
+    }
+
+    const numMatch = priceText.match(/(\d+(?:\.\d+)?)/);
+    result.price_value = numMatch ? numMatch[1] : '';
+
+    if (/元|人民币|RMB|CNY/i.test(priceText)) {
+      result.price_currency = 'CNY';
+    } else if (/USD|\$|美元/i.test(priceText)) {
+      result.price_currency = 'USD';
+    } else if (/EUR|€|欧元/i.test(priceText)) {
+      result.price_currency = 'EUR';
+    } else if (/GBP|£|英镑/i.test(priceText)) {
+      result.price_currency = 'GBP';
+    } else if (/JPY|日元|円|¥/i.test(priceText)) {
+      result.price_currency = 'JPY';
+    }
+
+    return result;
+  }
+
+  function parseInfoBlock(doc) {
+    const infoEl = qs('#info', doc);
+    const result = {
+      publisher: '',
+      publish_year: '',
+      price: '',
+      price_value: '',
+      price_currency: '',
+      binding: '',
+      pages: '',
+      isbn: '',
+      translator: '',
+      subtitle: '',
+      original_title: '',
+      series: '',
+      edition: '',
+    };
+
+    if (!infoEl) {
+      return result;
+    }
+
+    const infoMap = {};
+    let currentLabel = '';
+    let currentParts = [];
+
+    function flush() {
+      if (currentLabel) {
+        infoMap[currentLabel] = normalizeText(currentParts.join(' '));
+      }
+      currentLabel = '';
+      currentParts = [];
+    }
+
+    Array.from(infoEl.childNodes).forEach((node) => {
+      if (
+        node.nodeType === 1 &&
+        node.tagName === 'SPAN' &&
+        node.classList.contains('pl')
+      ) {
+        flush();
+        currentLabel = normalizeText(node.textContent).replace(/[：:]\s*$/, '');
+      } else if (node.nodeType === 1 && node.tagName === 'BR') {
+        flush();
+      } else if (currentLabel) {
+        const txt = normalizeText(node.textContent || '');
+        if (txt) {
+          currentParts.push(txt);
+        }
+      }
+    });
+
+    flush();
+
+    result.publisher = infoMap['出版社'] || '';
+    result.subtitle = infoMap['副标题'] || '';
+    result.original_title = infoMap['原作名'] || '';
+    result.publish_year = infoMap['出版年'] || '';
+    result.pages = infoMap['页数'] || '';
+    result.binding = infoMap['装帧'] || '';
+    result.isbn = infoMap['ISBN'] || '';
+    result.translator = infoMap['译者'] || '';
+    result.series = infoMap['丛书'] || '';
+    result.edition = infoMap['版次'] || '';
+
+    const priceInfo = parsePriceInfo(infoMap['定价'] || '');
+    result.price = priceInfo.price;
+    result.price_value = priceInfo.price_value;
+    result.price_currency = priceInfo.price_currency;
+
+    return result;
+  }
+
+  async function fetchWithRetry(url, attempt = 0) {
+    try {
+      const resp = await fetch(url, {
+        credentials: 'include',
+      });
+
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+
+      return await resp.text();
+    } catch (error) {
+      if (attempt < RETRY_TIMES) {
+        await sleep(RATE_LIMIT_MS * (attempt + 1));
+        return fetchWithRetry(url, attempt + 1);
+      }
+      throw error;
+    }
+  }
+
+  async function enrichBookItem(item) {
+    try {
+      const html = await fetchWithRetry(item.link);
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const detail = parseInfoBlock(doc);
+
+      return {
+        ...item,
+        ...detail,
+        fetch_status: 'ok',
+        fetch_error: '',
+      };
+    } catch (error) {
+      return {
+        ...item,
+        fetch_status: 'failed',
+        fetch_error: String(error?.message || error || 'unknown error'),
+      };
+    }
+  }
+
+  async function enrichItemsSequentially(items) {
+    const enriched = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const current = items[i];
+      setOverlayStatus(
+        `正在抓取详情页...\n` +
+        `当前页进度：${i + 1}/${items.length}\n` +
+        `书名：${current.title}`
+      );
+
+      const detailItem = await enrichBookItem(current);
+      enriched.push(detailItem);
+      await sleep(RATE_LIMIT_MS);
+    }
+
+    return enriched;
+  }
+
+  function buildNextPageUrl(nextHref, runId) {
+    const nextUrl = new URL(nextHref, location.href);
+    nextUrl.searchParams.set('export_product_import', '1');
+    nextUrl.searchParams.set('run_id', runId);
+    return nextUrl.toString();
+  }
+
+  function getNextPageUrl(runId) {
+    const nextAnchor = qs('.paginator span.next a');
+    if (!nextAnchor) {
+      return '';
+    }
+    return buildNextPageUrl(nextAnchor.getAttribute('href'), runId);
+  }
+
+  function mergeItemsIntoState(state, newItems) {
+    const existingKeys = new Set(
+      state.items.map((item) => `${item.subject_id}__${item.rating_date}__${item.title}`)
+    );
+
+    newItems.forEach((item) => {
+      const key = `${item.subject_id}__${item.rating_date}__${item.title}`;
+      if (!existingKeys.has(key)) {
+        state.items.push(item);
+        existingKeys.add(key);
+      }
+    });
+  }
+
+  function safePinyinInitial(char) {
+    try {
+      if (
+        typeof pinyinPro !== 'undefined' &&
+        pinyinPro &&
+        typeof pinyinPro.pinyin === 'function'
+      ) {
+        const result = pinyinPro.pinyin(char, {
+          pattern: 'first',
+          toneType: 'none',
+          type: 'array',
+        });
+        if (Array.isArray(result) && result.length) {
+          return String(result[0] || '').toLowerCase();
+        }
+        if (typeof result === 'string') {
+          return result.toLowerCase();
+        }
+      }
+    } catch (error) {
+      console.warn('[豆瓣商品导入版] 拼音转换失败：', error);
+    }
+    return '';
+  }
+
+  function isChineseChar(char) {
+    return /[\u3400-\u9fff]/.test(char);
+  }
+
+  function normalizeAsciiSegment(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/['"`’‘]/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
+
+  function buildBaseSelfEncoding(title, subjectId) {
+    const text = normalizeText(title);
+    if (!text) {
+      return `book-${subjectId || 'unknown'}`;
+    }
+
+    let output = '';
+    let buffer = '';
+
+    function flushBuffer() {
+      if (!buffer) return;
+      const normalized = normalizeAsciiSegment(buffer);
+      if (normalized) {
+        if (output && !output.endsWith('-')) {
+          output += '-';
+        }
+        output += normalized;
+      }
+      buffer = '';
+    }
+
+    for (const char of text) {
+      if (isChineseChar(char)) {
+        flushBuffer();
+        const initial = safePinyinInitial(char);
+        if (initial) {
+          output += initial;
+        }
+      } else if (/[A-Za-z0-9]/.test(char)) {
+        buffer += char;
+      } else {
+        flushBuffer();
+        if (output && !output.endsWith('-')) {
+          output += '-';
+        }
+      }
+    }
+
+    flushBuffer();
+
+    output = output
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase();
+
+    if (!output) {
+      return `book-${subjectId || 'unknown'}`;
+    }
+
+    return output;
+  }
+
+  function ensureUniqueSuffix(base, usedSet) {
+    let candidate = base;
+    let index = 2;
+    while (usedSet.has(candidate)) {
+      candidate = `${base}-${index}`;
+      index += 1;
+    }
+    usedSet.add(candidate);
+    return candidate;
+  }
+
+  function parsePublicationYear(raw) {
+    const match = String(raw || '').match(/(\d{4})/);
+    return match ? Number(match[1]) : null;
+  }
+
+  function parsePriceNumber(raw) {
+    const match = String(raw || '').match(/(\d+(?:\.\d+)?)/);
+    return match ? Number(match[1]) : 0;
+  }
+
+  function dedupeRecords(items) {
+    const seen = new Set();
+    const result = [];
+
+    items.forEach((item) => {
+      const isbn = normalizeText(item.isbn);
+      const subjectId = normalizeText(item.subject_id);
+      const title = normalizeText(item.title).toLowerCase();
+      const author = normalizeText(item.author).toLowerCase();
+
+      const key = isbn
+        ? `isbn:${isbn}`
+        : subjectId
+        ? `subject:${subjectId}`
+        : `title:${title}::author:${author}`;
+
+      if (!seen.has(key)) {
+        seen.add(key);
+        result.push(item);
+      }
+    });
+
+    return result;
+  }
+
+  function toProductImportObjects(items) {
+    const deduped = dedupeRecords(items);
+    const usedSelfEncodings = new Set();
+    const usedProductIds = new Set();
+
+    return deduped.map((item) => {
+      const isbn = normalizeText(item.isbn) || null;
+      const subjectId = normalizeText(item.subject_id);
+      const parsedPrice = parsePriceNumber(item.price_value || item.price);
+      const publicationYear = parsePublicationYear(item.publish_year || item.release_date);
+
+      let productIdBase = isbn || `DB-${subjectId || 'UNKNOWN'}`;
+      productIdBase = normalizeText(productIdBase);
+      const productId = ensureUniqueSuffix(productIdBase, usedProductIds);
+
+      const selfEncodingBase = buildBaseSelfEncoding(item.title, subjectId);
+      const selfEncoding = ensureUniqueSuffix(selfEncodingBase, usedSelfEncodings);
+
+      return {
+        id: 0,
+        productId,
+        title: normalizeText(item.title),
+        author: normalizeText(item.author),
+        isbn,
+        price: parsedPrice,
+        category: DEFAULT_OPTION,
+        categoryId: null,
+        publisher: normalizeText(item.publisher) || DEFAULT_OPTION,
+        publisherId: null,
+        selfEncoding,
+        internalPricing: null,
+        purchasePrice: parsedPrice || null,
+        publicationYear,
+        edition: normalizeText(item.edition) || null,
+        binding: normalizeText(item.binding) || DEFAULT_OPTION,
+        retailDiscount: null,
+        wholesaleDiscount: null,
+        wholesalePrice: null,
+        memberDiscount: null,
+        purchaseSaleMode: DEFAULT_OPTION,
+        purchaseSaleModeId: null,
+        bookmark: null,
+        packaging: DEFAULT_OPTION,
+        property: DEFAULT_OPTION,
+        statisticalClass: DEFAULT_OPTION,
+        status: 1,
+        stockUnit: DEFAULT_STOCK_UNIT,
+        stockLowerLimitQty: null,
+        stockUpperLimitQty: null,
+        createdBy: null,
+        updatedBy: null,
+        operator: DEFAULT_OPERATOR,
+        createdAt: null,
+        updatedAt: null,
+      };
+    });
+  }
+
+  function saveTextFile(fileName, content, mimeType) {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.style.display = 'none';
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return url;
+  }
+
+  function exportJsonFile(fileName, data) {
+    const jsonText = JSON.stringify(data, null, 2);
+    return saveTextFile(fileName, jsonText, 'application/json;charset=utf-8;');
+  }
+
+  function exportCsvFile(fileName, rows, headers) {
+    const utf8Bom = '\uFEFF';
+    let csv = '';
+
+    csv += headers.map((h) => h.label).join(',') + '\r\n';
+
+    rows.forEach((row) => {
+      const line = headers
+        .map((h) => `"${String(row[h.key] ?? '').replace(/"/g, '""')}"`)
+        .join(',');
+      csv += line + '\r\n';
+    });
+
+    return saveTextFile(fileName, utf8Bom + csv, 'text/csv;charset=utf-8;');
+  }
+
+  function buildFormAlignedCsvRows(productItems) {
+    return productItems.map((item) => ({
+      title: item.title,
+      productId: item.productId,
+      author: item.author,
+      price: item.price,
+      selfEncoding: item.selfEncoding,
+      operator: item.operator,
+      isbn: item.isbn || '',
+      category: item.category || '',
+      publisher: item.publisher || '',
+      publicationYear: item.publicationYear ?? '',
+      purchaseSaleMode: item.purchaseSaleMode || '',
+      packaging: item.packaging || '',
+      binding: item.binding || '',
+      property: item.property || '',
+      statisticalClass: item.statisticalClass || '',
+      internalPricing: item.internalPricing ?? '',
+      purchasePrice: item.purchasePrice ?? '',
+      retailDiscount: item.retailDiscount ?? '',
+      memberDiscount: item.memberDiscount ?? '',
+      wholesaleDiscount: item.wholesaleDiscount ?? '',
+      wholesalePrice: item.wholesalePrice ?? '',
+      stockUnit: item.stockUnit || '',
+      stockLowerLimitQty: item.stockLowerLimitQty ?? '',
+      stockUpperLimitQty: item.stockUpperLimitQty ?? '',
+      edition: item.edition || '',
+      bookmark: item.bookmark || '',
+    }));
+  }
+
+  async function exportAll(people, isWish, state) {
+    const productItems = toProductImportObjects(state.items);
+    const csvRows = buildFormAlignedCsvRows(productItems);
+
+    const datePart = new Date().toISOString().split('T')[0].replaceAll('-', '');
+    const baseName = `db-book-product-import-${isWish ? 'wishlist-' : ''}${datePart}`;
+    const jsonFileName = `${baseName}.json`;
+    const csvFileName = `${baseName}.csv`;
+
+    setOverlayStatus(
+      `准备导出...\n` +
+      `总条目数：${productItems.length}\n` +
+      `模式：${isWish ? '想读' : '读过'}\n` +
+      `将下载 JSON + CSV 两个文件`
+    );
+
+    if (!productItems.length) {
+      alert('没有可导出的商品数据');
+      clearState(people, isWish);
+      return;
+    }
+
+    const csvHeaders = [
+      { key: 'title', label: '书名' },
+      { key: 'productId', label: '商品编码' },
+      { key: 'author', label: '作者' },
+      { key: 'price', label: '售价' },
+      { key: 'selfEncoding', label: '自编码' },
+      { key: 'operator', label: '操作人员' },
+      { key: 'isbn', label: 'ISBN' },
+      { key: 'category', label: '商品类别' },
+      { key: 'publisher', label: '出版社' },
+      { key: 'publicationYear', label: '出版年' },
+      { key: 'purchaseSaleMode', label: '购销方式' },
+      { key: 'packaging', label: '包装' },
+      { key: 'binding', label: '装帧' },
+      { key: 'property', label: '商品属性' },
+      { key: 'statisticalClass', label: '统计分类' },
+      { key: 'internalPricing', label: '内部定价' },
+      { key: 'purchasePrice', label: '进货价' },
+      { key: 'retailDiscount', label: '零售折扣' },
+      { key: 'memberDiscount', label: '会员折扣' },
+      { key: 'wholesaleDiscount', label: '批发折扣' },
+      { key: 'wholesalePrice', label: '批发价' },
+      { key: 'stockUnit', label: '库存单位' },
+      { key: 'stockLowerLimitQty', label: '库存下限' },
+      { key: 'stockUpperLimitQty', label: '库存上限' },
+      { key: 'edition', label: '版次' },
+      { key: 'bookmark', label: '书标' },
+    ];
+
+    const jsonUrl = exportJsonFile(jsonFileName, productItems);
+    await sleep(300);
+    const csvUrl = exportCsvFile(csvFileName, csvRows, csvHeaders);
+
+    setOverlayStatus(
+      `导出完成。\n` +
+      `JSON：${jsonFileName}\n` +
+      `CSV：${csvFileName}\n` +
+      `条目数：${productItems.length}`
+    );
+
+    setOverlayActions(`
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <a href="${jsonUrl}" download="${jsonFileName}"
+           style="display:inline-block;background:#42bd56;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;text-align:center;">
+          如果 JSON 没自动下载，点这里
+        </a>
+        <a href="${csvUrl}" download="${csvFileName}"
+           style="display:inline-block;background:#2d8cf0;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;text-align:center;">
+          如果 CSV 没自动下载，点这里
+        </a>
+      </div>
+    `);
+
+    clearState(people, isWish);
+  }
+
+  async function runExport() {
+    const people = getPeopleIdFromUrl();
+    const isWish = isWishMode();
+    const currentStart = getCurrentStart();
+
+    if (!people) {
+      alert('无法识别豆瓣用户 ID');
+      return;
+    }
+
+    let state = loadState(people, isWish);
+
+    if (currentStart === 0 || !state) {
+      state = createNewState(people, isWish);
+      saveState(people, isWish, state);
+    }
+
+    if (!Array.isArray(state.visitedStarts) || !Array.isArray(state.items)) {
+      state = createNewState(people, isWish);
+      saveState(people, isWish, state);
+    }
+
+    if (state.visitedStarts.includes(currentStart)) {
+      const nextPageUrl = getNextPageUrl(state.runId);
+      if (nextPageUrl) {
+        setOverlayStatus(
+          `检测到当前页已处理过，准备跳到下一页...\n当前 start=${currentStart}`
+        );
+        location.href = nextPageUrl;
+        return;
+      }
+
+      await exportAll(people, isWish, state);
+      return;
+    }
+
+    setOverlayStatus(
+      `正在抓取列表页...\n` +
+      `模式：${isWish ? '想读' : '读过'}\n` +
+      `当前 start=${currentStart}`
+    );
+
+    const pageItems = parseListPageItems(isWish);
+
+    if (!pageItems.length) {
+      console.warn('[豆瓣商品导入版] 当前页没有识别到条目');
+      const nextPageUrl = getNextPageUrl(state.runId);
+      if (nextPageUrl) {
+        location.href = nextPageUrl;
+        return;
+      }
+      await exportAll(people, isWish, state);
+      return;
+    }
+
+    const enrichedItems = await enrichItemsSequentially(pageItems);
+
+    state.visitedStarts.push(currentStart);
+    mergeItemsIntoState(state, enrichedItems);
+    saveState(people, isWish, state);
+
+    const nextPageUrl = getNextPageUrl(state.runId);
+    if (nextPageUrl) {
+      setOverlayStatus(
+        `当前页完成。\n` +
+        `已累计条目：${state.items.length}\n` +
+        `准备跳转下一页...`
+      );
+      location.href = nextPageUrl;
+      return;
+    }
+
+    await exportAll(people, isWish, state);
+  }
+
+  if (isHomepage() || (isBookListPage() && !isExportMode())) {
+    injectLauncherPanel();
+  }
+
+  if (isBookListPage() && isExportMode()) {
+    runExport().catch((error) => {
+      console.error('[豆瓣商品导入版] 运行失败：', error);
+      setOverlayStatus(`运行失败：\n${String(error?.message || error)}`);
+      alert('脚本运行失败，请打开控制台查看错误');
+    });
+  }
+})();

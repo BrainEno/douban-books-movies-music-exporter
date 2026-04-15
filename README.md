@@ -1,2 +1,3 @@
 # douban_books_export_script
 豆瓣读书批量导出脚本
+复制粘贴到油猴或脚本猫保存使用，可导出json和csv
