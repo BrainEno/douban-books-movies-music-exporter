@@ -1,12 +1,13 @@
 // ==UserScript==
-// @name         豆瓣读书商品导入版（稳定下载 JSON / CSV）
+// @name         豆瓣读书商品导入版（支持读过/想读/豆列）
 // @namespace    https://chat.openai.com/
-// @version      1.1.0
-// @description  从豆瓣读过/想读列表抓取图书详情，导出可用于图书管理系统导入的 ProductModel JSON 和表单对齐 CSV
+// @version      1.2.0
+// @description  从豆瓣读过/想读/豆列中抓取图书详情，导出可用于图书管理系统导入的 ProductModel JSON 和表单对齐 CSV
 // @author       OpenAI
 // @match        https://book.douban.com/people/*/collect*
 // @match        https://book.douban.com/people/*/wish*
 // @match        https://www.douban.com/people/*
+// @match        https://www.douban.com/doulist/*
 // @require      https://cdn.jsdelivr.net/gh/zh-lx/pinyin-pro@latest/dist/pinyin-pro.js
 // @grant        none
 // ==/UserScript==
@@ -27,6 +28,11 @@
     JSON: 'json',
     CSV: 'csv',
     BOTH: 'both',
+  };
+
+  const SOURCE_TYPES = {
+    PEOPLE: 'people',
+    DOULIST: 'doulist',
   };
 
   const ACTIVE_OBJECT_URLS = [];
@@ -55,6 +61,10 @@
     return location.hostname === 'book.douban.com' && /^\/people\/[^/]+\/(collect|wish)/.test(location.pathname);
   }
 
+  function isDoulistPage() {
+    return location.hostname === 'www.douban.com' && /^\/doulist\/\d+/.test(location.pathname);
+  }
+
   function isExportMode() {
     return new URLSearchParams(location.search).get('export_product_import') === '1';
   }
@@ -65,6 +75,11 @@
 
   function getPeopleIdFromUrl() {
     const match = location.pathname.match(/\/people\/([^/]+)\//);
+    return match ? match[1] : '';
+  }
+
+  function getDoulistIdFromUrl() {
+    const match = location.pathname.match(/\/doulist\/(\d+)/);
     return match ? match[1] : '';
   }
 
@@ -85,14 +100,46 @@
     return EXPORT_FORMATS.BOTH;
   }
 
+  function getSourceType() {
+    if (isDoulistPage()) {
+      return SOURCE_TYPES.DOULIST;
+    }
+    return SOURCE_TYPES.PEOPLE;
+  }
+
+  function getSourceId() {
+    return getSourceType() === SOURCE_TYPES.DOULIST
+      ? getDoulistIdFromUrl()
+      : getPeopleIdFromUrl();
+  }
+
+  function getSourceMode() {
+    if (getSourceType() === SOURCE_TYPES.DOULIST) {
+      return 'doulist';
+    }
+    return isWishMode() ? 'wish' : 'collect';
+  }
+
   function extractSubjectId(link) {
     const match = String(link || '').match(/subject\/(\d+)\//);
     return match ? match[1] : '';
   }
 
-  function buildBookExportUrl(people, isWish, format) {
+  function isBookSubjectUrl(url) {
+    return /https?:\/\/book\.douban\.com\/subject\/\d+\/?/.test(String(url || ''));
+  }
+
+  function buildPeopleExportUrl(people, isWish, format) {
     const mode = isWish ? 'wish' : 'collect';
     return `https://book.douban.com/people/${people}/${mode}?start=0&sort=time&rating=all&filter=all&mode=list&${EXPORT_FLAG}&format=${encodeURIComponent(format)}`;
+  }
+
+  function buildDoulistExportUrl(format) {
+    const url = new URL(location.href);
+    url.searchParams.set('start', '0');
+    url.searchParams.set('export_product_import', '1');
+    url.searchParams.set('format', format);
+    return url.toString();
   }
 
   function registerObjectUrl(url) {
@@ -135,7 +182,7 @@
       'border-radius:10px',
       'box-shadow:0 8px 24px rgba(0,0,0,.15)',
       'padding:12px',
-      'width:290px',
+      'width:300px',
       'font-size:13px',
       'line-height:1.5',
       'color:#333'
@@ -146,12 +193,49 @@
   }
 
   function injectLauncherPanel() {
+    const sourceType = getSourceType();
+    const panel = createFloatingPanel();
+
+    if (sourceType === SOURCE_TYPES.DOULIST) {
+      const doulistId = getDoulistIdFromUrl();
+      panel.innerHTML = `
+        <div style="font-weight:700;margin-bottom:8px;">豆瓣读书商品导入版</div>
+        <div style="color:#666;margin-bottom:10px;">
+          当前页面识别为书单 / 豆列页面。脚本会只导出其中的图书条目，并抓取 ISBN、出版社、定价等字段。
+          <br><br>当前豆列 ID：${doulistId || '-'}
+        </div>
+
+        <label style="display:block;margin-bottom:6px;font-weight:600;">导出格式</label>
+        <select id="douban-export-format-select"
+                style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;">
+          <option value="json">只导出 JSON</option>
+          <option value="csv">只导出 CSV</option>
+          <option value="both" selected>导出 JSON + CSV</option>
+        </select>
+
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <button id="douban-export-doulist-btn"
+                  style="border:none;background:#7b61ff;color:#fff;padding:8px 10px;border-radius:6px;cursor:pointer;">
+            导出当前书单为导入文件
+          </button>
+        </div>
+      `;
+
+      const select = qs('#douban-export-format-select', panel);
+      const btn = qs('#douban-export-doulist-btn', panel);
+      btn?.addEventListener('click', () => {
+        const format = select?.value || EXPORT_FORMATS.BOTH;
+        location.href = buildDoulistExportUrl(format);
+      });
+
+      return;
+    }
+
     const people = getPeopleIdFromUrl();
     if (!people) {
       return;
     }
 
-    const panel = createFloatingPanel();
     panel.innerHTML = `
       <div style="font-weight:700;margin-bottom:8px;">豆瓣读书商品导入版</div>
       <div style="color:#666;margin-bottom:10px;">
@@ -184,12 +268,12 @@
 
     collectBtn?.addEventListener('click', () => {
       const format = select?.value || EXPORT_FORMATS.BOTH;
-      location.href = buildBookExportUrl(people, false, format);
+      location.href = buildPeopleExportUrl(people, false, format);
     });
 
     wishBtn?.addEventListener('click', () => {
       const format = select?.value || EXPORT_FORMATS.BOTH;
-      location.href = buildBookExportUrl(people, true, format);
+      location.href = buildPeopleExportUrl(people, true, format);
     });
   }
 
@@ -243,12 +327,12 @@
     }
   }
 
-  function getStorageKey(people, isWish) {
-    return `${STORAGE_PREFIX}:${people}:${isWish ? 'wish' : 'collect'}`;
+  function getStorageKey(sourceType, sourceId, sourceMode) {
+    return `${STORAGE_PREFIX}:${sourceType}:${sourceId}:${sourceMode}`;
   }
 
-  function loadState(people, isWish) {
-    const raw = sessionStorage.getItem(getStorageKey(people, isWish));
+  function loadState(sourceType, sourceId, sourceMode) {
+    const raw = sessionStorage.getItem(getStorageKey(sourceType, sourceId, sourceMode));
     if (!raw) {
       return null;
     }
@@ -260,26 +344,30 @@
     }
   }
 
-  function saveState(people, isWish, state) {
-    sessionStorage.setItem(getStorageKey(people, isWish), JSON.stringify(state));
+  function saveState(sourceType, sourceId, sourceMode, state) {
+    sessionStorage.setItem(
+      getStorageKey(sourceType, sourceId, sourceMode),
+      JSON.stringify(state)
+    );
   }
 
-  function clearState(people, isWish) {
-    sessionStorage.removeItem(getStorageKey(people, isWish));
+  function clearState(sourceType, sourceId, sourceMode) {
+    sessionStorage.removeItem(getStorageKey(sourceType, sourceId, sourceMode));
   }
 
-  function createNewState(people, isWish) {
+  function createNewState(sourceType, sourceId, sourceMode) {
     return {
       runId: `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-      people,
-      isWish,
+      sourceType,
+      sourceId,
+      sourceMode,
       createdAt: new Date().toISOString(),
       items: [],
       visitedStarts: [],
     };
   }
 
-  function parseListPageItems(isWish) {
+  function parsePeoplePageItems(isWish) {
     const items = [];
     const listItems = qsa('li.item');
 
@@ -295,6 +383,10 @@
 
       const link = new URL(titleAnchor.getAttribute('href'), location.href).href;
       const subjectId = extractSubjectId(link);
+
+      if (!subjectId) {
+        return;
+      }
 
       const item = {
         title: normalizeText(titleAnchor.textContent),
@@ -363,6 +455,91 @@
     return items;
   }
 
+  function findLikelyDoulistBookContainer(anchor) {
+    let node = anchor;
+    while (node && node !== document.body) {
+      if (node.matches) {
+        const isCandidate =
+          node.matches('li, .item, .doulist-item, .bd, .content, .article, .doulist-subject');
+        if (isCandidate) {
+          const bookLinks = node.querySelectorAll('a[href*="book.douban.com/subject/"]').length;
+          if (bookLinks >= 1 && bookLinks <= 4) {
+            return node;
+          }
+        }
+      }
+      node = node.parentElement;
+    }
+    return anchor.parentElement || anchor;
+  }
+
+  function parseDoulistPageItems() {
+    const items = [];
+    const seen = new Set();
+
+    const anchors = qsa('a[href*="book.douban.com/subject/"]');
+
+    anchors.forEach((anchor) => {
+      const href = anchor.getAttribute('href');
+      if (!href) {
+        return;
+      }
+
+      const link = new URL(href, location.href).href;
+      if (!isBookSubjectUrl(link)) {
+        return;
+      }
+
+      const subjectId = extractSubjectId(link);
+      if (!subjectId || seen.has(subjectId)) {
+        return;
+      }
+
+      const rawTitle = normalizeText(anchor.textContent);
+      if (!rawTitle) {
+        return;
+      }
+
+      const container = findLikelyDoulistBookContainer(anchor);
+      const blockText = normalizeText(container.textContent);
+
+      // 简单过滤掉明显不是书目标题的锚点
+      if (blockText.length < 2) {
+        return;
+      }
+
+      seen.add(subjectId);
+
+      items.push({
+        title: rawTitle,
+        link,
+        subject_id: subjectId,
+        rating: '',
+        rating_date: '',
+        comment: '',
+        release_date: '',
+        author: '',
+        publisher: '',
+        publish_year: '',
+        price: '',
+        price_value: '',
+        price_currency: '',
+        binding: '',
+        pages: '',
+        isbn: '',
+        translator: '',
+        subtitle: '',
+        original_title: '',
+        series: '',
+        edition: '',
+        fetch_status: 'pending',
+        fetch_error: '',
+      });
+    });
+
+    return items;
+  }
+
   function parsePriceInfo(priceText) {
     const result = {
       price: priceText || '',
@@ -392,9 +569,11 @@
     return result;
   }
 
-  function parseInfoBlock(doc) {
+  function parseInfoBlock(doc, fallbackTitle = '') {
     const infoEl = qs('#info', doc);
     const result = {
+      title: '',
+      author: '',
       publisher: '',
       publish_year: '',
       price: '',
@@ -409,6 +588,9 @@
       series: '',
       edition: '',
     };
+
+    const titleEl = qs('#wrapper h1 span', doc) || qs('h1 span', doc) || qs('h1', doc);
+    result.title = normalizeText(titleEl?.textContent || fallbackTitle || '');
 
     if (!infoEl) {
       return result;
@@ -446,6 +628,7 @@
 
     flush();
 
+    result.author = infoMap['作者'] || '';
     result.publisher = infoMap['出版社'] || '';
     result.subtitle = infoMap['副标题'] || '';
     result.original_title = infoMap['原作名'] || '';
@@ -489,11 +672,13 @@
     try {
       const html = await fetchWithRetry(item.link);
       const doc = new DOMParser().parseFromString(html, 'text/html');
-      const detail = parseInfoBlock(doc);
+      const detail = parseInfoBlock(doc, item.title);
 
       return {
         ...item,
         ...detail,
+        title: detail.title || item.title,
+        author: detail.author || item.author,
         fetch_status: 'ok',
         fetch_error: '',
       };
@@ -525,6 +710,25 @@
     return enriched;
   }
 
+  function getRawNextPageHref() {
+    const selectors = [
+      '.paginator span.next a',
+      '.paginator .next a',
+      'span.next a',
+      'a.next',
+      '.next a'
+    ];
+
+    for (const selector of selectors) {
+      const anchor = qs(selector);
+      if (anchor && anchor.getAttribute('href')) {
+        return anchor.getAttribute('href');
+      }
+    }
+
+    return '';
+  }
+
   function buildNextPageUrl(nextHref, runId, format) {
     const nextUrl = new URL(nextHref, location.href);
     nextUrl.searchParams.set('export_product_import', '1');
@@ -534,11 +738,11 @@
   }
 
   function getNextPageUrl(runId, format) {
-    const nextAnchor = qs('.paginator span.next a');
-    if (!nextAnchor) {
+    const nextHref = getRawNextPageHref();
+    if (!nextHref) {
       return '';
     }
-    return buildNextPageUrl(nextAnchor.getAttribute('href'), runId, format);
+    return buildNextPageUrl(nextHref, runId, format);
   }
 
   function mergeItemsIntoState(state, newItems) {
@@ -768,7 +972,7 @@
   }
 
   function createJsonDownload(fileName, data) {
-    const jsonText = JSON.stringify(data); // 紧凑 JSON，优先速度和稳定性
+    const jsonText = JSON.stringify(data);
     const url = createBlobUrl(jsonText, 'application/octet-stream');
     return { fileName, url, size: jsonText.length };
   }
@@ -897,25 +1101,29 @@
     });
   }
 
-  async function exportAll(people, isWish, state, format) {
+  async function exportAll(sourceType, sourceId, sourceMode, state, format) {
     const productItems = toProductImportObjects(state.items);
     const csvRows = buildFormAlignedCsvRows(productItems);
 
     const datePart = new Date().toISOString().split('T')[0].replaceAll('-', '');
-    const baseName = `db-book-product-import-${isWish ? 'wishlist-' : ''}${datePart}`;
+    const baseName =
+      sourceType === SOURCE_TYPES.DOULIST
+        ? `db-book-product-import-doulist-${sourceId}-${datePart}`
+        : `db-book-product-import-${sourceMode === 'wish' ? 'wishlist-' : ''}${datePart}`;
+
     const jsonFileName = `${baseName}.json`;
     const csvFileName = `${baseName}.csv`;
 
     setOverlayStatus(
       `准备导出...\n` +
+      `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
       `总条目数：${productItems.length}\n` +
-      `模式：${isWish ? '想读' : '读过'}\n` +
       `导出格式：${format}`
     );
 
     if (!productItems.length) {
       alert('没有可导出的商品数据');
-      clearState(people, isWish);
+      clearState(sourceType, sourceId, sourceMode);
       return;
     }
 
@@ -967,6 +1175,7 @@
 
     setOverlayStatus(
       `导出完成。\n` +
+      `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
       `格式：${format}\n` +
       `条目数：${productItems.length}\n` +
       `${jsonDownload ? `JSON：${jsonFileName}\n` : ''}` +
@@ -974,30 +1183,31 @@
       `如果没有自动下载，请点下面的按钮。`
     );
 
-    clearState(people, isWish);
+    clearState(sourceType, sourceId, sourceMode);
   }
 
   async function runExport() {
-    const people = getPeopleIdFromUrl();
-    const isWish = isWishMode();
+    const sourceType = getSourceType();
+    const sourceId = getSourceId();
+    const sourceMode = getSourceMode();
     const currentStart = getCurrentStart();
     const format = getExportFormatFromUrl();
 
-    if (!people) {
-      alert('无法识别豆瓣用户 ID');
+    if (!sourceId) {
+      alert('无法识别当前页面来源 ID');
       return;
     }
 
-    let state = loadState(people, isWish);
+    let state = loadState(sourceType, sourceId, sourceMode);
 
     if (currentStart === 0 || !state) {
-      state = createNewState(people, isWish);
-      saveState(people, isWish, state);
+      state = createNewState(sourceType, sourceId, sourceMode);
+      saveState(sourceType, sourceId, sourceMode, state);
     }
 
     if (!Array.isArray(state.visitedStarts) || !Array.isArray(state.items)) {
-      state = createNewState(people, isWish);
-      saveState(people, isWish, state);
+      state = createNewState(sourceType, sourceId, sourceMode);
+      saveState(sourceType, sourceId, sourceMode, state);
     }
 
     if (state.visitedStarts.includes(currentStart)) {
@@ -1010,27 +1220,30 @@
         return;
       }
 
-      await exportAll(people, isWish, state, format);
+      await exportAll(sourceType, sourceId, sourceMode, state, format);
       return;
     }
 
     setOverlayStatus(
       `正在抓取列表页...\n` +
-      `模式：${isWish ? '想读' : '读过'}\n` +
+      `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
       `当前 start=${currentStart}\n` +
       `导出格式：${format}`
     );
 
-    const pageItems = parseListPageItems(isWish);
+    const pageItems =
+      sourceType === SOURCE_TYPES.DOULIST
+        ? parseDoulistPageItems()
+        : parsePeoplePageItems(sourceMode === 'wish');
 
     if (!pageItems.length) {
-      console.warn('[豆瓣商品导入版] 当前页没有识别到条目');
+      console.warn('[豆瓣商品导入版] 当前页没有识别到图书条目');
       const nextPageUrl = getNextPageUrl(state.runId, format);
       if (nextPageUrl) {
         location.href = nextPageUrl;
         return;
       }
-      await exportAll(people, isWish, state, format);
+      await exportAll(sourceType, sourceId, sourceMode, state, format);
       return;
     }
 
@@ -1038,7 +1251,7 @@
 
     state.visitedStarts.push(currentStart);
     mergeItemsIntoState(state, enrichedItems);
-    saveState(people, isWish, state);
+    saveState(sourceType, sourceId, sourceMode, state);
 
     const nextPageUrl = getNextPageUrl(state.runId, format);
     if (nextPageUrl) {
@@ -1051,14 +1264,18 @@
       return;
     }
 
-    await exportAll(people, isWish, state, format);
+    await exportAll(sourceType, sourceId, sourceMode, state, format);
   }
 
-  if (isHomepage() || (isBookListPage() && !isExportMode())) {
+  if (
+    isHomepage() ||
+    isDoulistPage() ||
+    (isBookListPage() && !isExportMode())
+  ) {
     injectLauncherPanel();
   }
 
-  if (isBookListPage() && isExportMode()) {
+  if ((isBookListPage() || isDoulistPage()) && isExportMode()) {
     runExport().catch((error) => {
       console.error('[豆瓣商品导入版] 运行失败：', error);
       setOverlayStatus(`运行失败：\n${String(error?.message || error)}`);
