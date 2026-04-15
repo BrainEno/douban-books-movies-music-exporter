@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         豆瓣读书商品导入版（导出 ProductModel JSON + 表单对齐 CSV）
+// @name         豆瓣读书商品导入版（稳定下载 JSON / CSV）
 // @namespace    https://chat.openai.com/
-// @version      1.0.0
-// @description  从豆瓣读过/想读列表抓取图书详情，导出可用于图书管理系统导入的 JSON 和 CSV
+// @version      1.1.0
+// @description  从豆瓣读过/想读列表抓取图书详情，导出可用于图书管理系统导入的 ProductModel JSON 和表单对齐 CSV
 // @author       OpenAI
 // @match        https://book.douban.com/people/*/collect*
 // @match        https://book.douban.com/people/*/wish*
@@ -21,6 +21,15 @@
   const DEFAULT_OPERATOR = 'douban-import-script';
   const DEFAULT_STOCK_UNIT = '册';
   const DEFAULT_OPTION = '不区分';
+  const DOWNLOAD_URL_KEEP_MS = 5 * 60 * 1000;
+
+  const EXPORT_FORMATS = {
+    JSON: 'json',
+    CSV: 'csv',
+    BOTH: 'both',
+  };
+
+  const ACTIVE_OBJECT_URLS = [];
 
   function qs(selector, root = document) {
     return root.querySelector(selector);
@@ -64,15 +73,49 @@
     return Number(params.get('start') || '0');
   }
 
+  function getExportFormatFromUrl() {
+    const format = new URLSearchParams(location.search).get('format');
+    if (
+      format === EXPORT_FORMATS.JSON ||
+      format === EXPORT_FORMATS.CSV ||
+      format === EXPORT_FORMATS.BOTH
+    ) {
+      return format;
+    }
+    return EXPORT_FORMATS.BOTH;
+  }
+
   function extractSubjectId(link) {
     const match = String(link || '').match(/subject\/(\d+)\//);
     return match ? match[1] : '';
   }
 
-  function buildBookExportUrl(people, isWish) {
+  function buildBookExportUrl(people, isWish, format) {
     const mode = isWish ? 'wish' : 'collect';
-    return `https://book.douban.com/people/${people}/${mode}?start=0&sort=time&rating=all&filter=all&mode=list&${EXPORT_FLAG}`;
+    return `https://book.douban.com/people/${people}/${mode}?start=0&sort=time&rating=all&filter=all&mode=list&${EXPORT_FLAG}&format=${encodeURIComponent(format)}`;
   }
+
+  function registerObjectUrl(url) {
+    ACTIVE_OBJECT_URLS.push(url);
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (_) {}
+      const index = ACTIVE_OBJECT_URLS.indexOf(url);
+      if (index >= 0) {
+        ACTIVE_OBJECT_URLS.splice(index, 1);
+      }
+    }, DOWNLOAD_URL_KEEP_MS);
+  }
+
+  window.addEventListener('beforeunload', () => {
+    ACTIVE_OBJECT_URLS.forEach((url) => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (_) {}
+    });
+    ACTIVE_OBJECT_URLS.length = 0;
+  });
 
   function createFloatingPanel() {
     let panel = document.getElementById('douban-book-product-import-panel');
@@ -92,7 +135,7 @@
       'border-radius:10px',
       'box-shadow:0 8px 24px rgba(0,0,0,.15)',
       'padding:12px',
-      'width:270px',
+      'width:290px',
       'font-size:13px',
       'line-height:1.5',
       'color:#333'
@@ -112,21 +155,42 @@
     panel.innerHTML = `
       <div style="font-weight:700;margin-bottom:8px;">豆瓣读书商品导入版</div>
       <div style="color:#666;margin-bottom:10px;">
-        自动抓取 ISBN、出版社、定价、装帧等字段，导出：
-        <br>1. ProductModel JSON
-        <br>2. 表单对齐 CSV
+        自动抓取 ISBN、出版社、定价、装帧等字段，并导出为适合导入图书管理系统的文件
       </div>
+
+      <label style="display:block;margin-bottom:6px;font-weight:600;">导出格式</label>
+      <select id="douban-export-format-select"
+              style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;">
+        <option value="json">只导出 JSON</option>
+        <option value="csv">只导出 CSV</option>
+        <option value="both" selected>导出 JSON + CSV</option>
+      </select>
+
       <div style="display:flex;flex-direction:column;gap:8px;">
-        <a href="${buildBookExportUrl(people, false)}"
-           style="display:block;text-align:center;background:#42bd56;color:#fff;text-decoration:none;padding:8px 10px;border-radius:6px;">
+        <button id="douban-export-collect-btn"
+                style="border:none;background:#42bd56;color:#fff;padding:8px 10px;border-radius:6px;cursor:pointer;">
           导出读过图书为导入文件
-        </a>
-        <a href="${buildBookExportUrl(people, true)}"
-           style="display:block;text-align:center;background:#2d8cf0;color:#fff;text-decoration:none;padding:8px 10px;border-radius:6px;">
+        </button>
+        <button id="douban-export-wish-btn"
+                style="border:none;background:#2d8cf0;color:#fff;padding:8px 10px;border-radius:6px;cursor:pointer;">
           导出想读图书为导入文件
-        </a>
+        </button>
       </div>
     `;
+
+    const select = qs('#douban-export-format-select', panel);
+    const collectBtn = qs('#douban-export-collect-btn', panel);
+    const wishBtn = qs('#douban-export-wish-btn', panel);
+
+    collectBtn?.addEventListener('click', () => {
+      const format = select?.value || EXPORT_FORMATS.BOTH;
+      location.href = buildBookExportUrl(people, false, format);
+    });
+
+    wishBtn?.addEventListener('click', () => {
+      const format = select?.value || EXPORT_FORMATS.BOTH;
+      location.href = buildBookExportUrl(people, true, format);
+    });
   }
 
   function ensureOverlay() {
@@ -142,7 +206,7 @@
       'right:20px',
       'bottom:20px',
       'z-index:1000000',
-      'width:340px',
+      'width:360px',
       'background:#fff',
       'border:1px solid #d9d9d9',
       'border-radius:12px',
@@ -461,19 +525,20 @@
     return enriched;
   }
 
-  function buildNextPageUrl(nextHref, runId) {
+  function buildNextPageUrl(nextHref, runId, format) {
     const nextUrl = new URL(nextHref, location.href);
     nextUrl.searchParams.set('export_product_import', '1');
     nextUrl.searchParams.set('run_id', runId);
+    nextUrl.searchParams.set('format', format);
     return nextUrl.toString();
   }
 
-  function getNextPageUrl(runId) {
+  function getNextPageUrl(runId, format) {
     const nextAnchor = qs('.paginator span.next a');
     if (!nextAnchor) {
       return '';
     }
-    return buildNextPageUrl(nextAnchor.getAttribute('href'), runId);
+    return buildNextPageUrl(nextAnchor.getAttribute('href'), runId, format);
   }
 
   function mergeItemsIntoState(state, newItems) {
@@ -684,28 +749,31 @@
     });
   }
 
-  function saveTextFile(fileName, content, mimeType) {
+  function createBlobUrl(content, mimeType) {
     const blob = new Blob([content], { type: mimeType });
     const url = URL.createObjectURL(blob);
+    registerObjectUrl(url);
+    return url;
+  }
 
+  function triggerDownload(url, fileName) {
     const a = document.createElement('a');
     a.style.display = 'none';
     a.href = url;
     a.download = fileName;
+    a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    return url;
   }
 
-  function exportJsonFile(fileName, data) {
-    const jsonText = JSON.stringify(data, null, 2);
-    return saveTextFile(fileName, jsonText, 'application/json;charset=utf-8;');
+  function createJsonDownload(fileName, data) {
+    const jsonText = JSON.stringify(data); // 紧凑 JSON，优先速度和稳定性
+    const url = createBlobUrl(jsonText, 'application/octet-stream');
+    return { fileName, url, size: jsonText.length };
   }
 
-  function exportCsvFile(fileName, rows, headers) {
+  function createCsvDownload(fileName, rows, headers) {
     const utf8Bom = '\uFEFF';
     let csv = '';
 
@@ -718,7 +786,8 @@
       csv += line + '\r\n';
     });
 
-    return saveTextFile(fileName, utf8Bom + csv, 'text/csv;charset=utf-8;');
+    const url = createBlobUrl(utf8Bom + csv, 'text/csv;charset=utf-8;');
+    return { fileName, url, size: csv.length };
   }
 
   function buildFormAlignedCsvRows(productItems) {
@@ -752,7 +821,83 @@
     }));
   }
 
-  async function exportAll(people, isWish, state) {
+  async function autoDownloadByFormat(format, jsonDownload, csvDownload) {
+    if (format === EXPORT_FORMATS.JSON && jsonDownload) {
+      triggerDownload(jsonDownload.url, jsonDownload.fileName);
+      return;
+    }
+
+    if (format === EXPORT_FORMATS.CSV && csvDownload) {
+      triggerDownload(csvDownload.url, csvDownload.fileName);
+      return;
+    }
+
+    if (format === EXPORT_FORMATS.BOTH) {
+      if (csvDownload) {
+        triggerDownload(csvDownload.url, csvDownload.fileName);
+      }
+      await sleep(1500);
+      if (jsonDownload) {
+        triggerDownload(jsonDownload.url, jsonDownload.fileName);
+      }
+    }
+  }
+
+  function buildManualDownloadButtons(format, jsonDownload, csvDownload) {
+    const parts = [];
+
+    if ((format === EXPORT_FORMATS.JSON || format === EXPORT_FORMATS.BOTH) && jsonDownload) {
+      parts.push(`
+        <a href="${jsonDownload.url}" download="${jsonDownload.fileName}"
+           style="display:inline-block;background:#42bd56;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;text-align:center;">
+          重新下载 JSON
+        </a>
+      `);
+    }
+
+    if ((format === EXPORT_FORMATS.CSV || format === EXPORT_FORMATS.BOTH) && csvDownload) {
+      parts.push(`
+        <a href="${csvDownload.url}" download="${csvDownload.fileName}"
+           style="display:inline-block;background:#2d8cf0;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;text-align:center;">
+          重新下载 CSV
+        </a>
+      `);
+    }
+
+    if (format === EXPORT_FORMATS.BOTH && jsonDownload && csvDownload) {
+      parts.unshift(`
+        <button id="douban-redownload-both-btn"
+                style="border:none;background:#111;color:#fff;padding:8px 12px;border-radius:6px;cursor:pointer;">
+          重新下载两个文件
+        </button>
+      `);
+    }
+
+    return `
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        ${parts.join('')}
+      </div>
+    `;
+  }
+
+  function attachRedownloadBothListener(jsonDownload, csvDownload) {
+    const btn = qs('#douban-redownload-both-btn');
+    if (!btn) {
+      return;
+    }
+
+    btn.addEventListener('click', async () => {
+      if (csvDownload) {
+        triggerDownload(csvDownload.url, csvDownload.fileName);
+      }
+      await sleep(1500);
+      if (jsonDownload) {
+        triggerDownload(jsonDownload.url, jsonDownload.fileName);
+      }
+    });
+  }
+
+  async function exportAll(people, isWish, state, format) {
     const productItems = toProductImportObjects(state.items);
     const csvRows = buildFormAlignedCsvRows(productItems);
 
@@ -765,7 +910,7 @@
       `准备导出...\n` +
       `总条目数：${productItems.length}\n` +
       `模式：${isWish ? '想读' : '读过'}\n` +
-      `将下载 JSON + CSV 两个文件`
+      `导出格式：${format}`
     );
 
     if (!productItems.length) {
@@ -803,29 +948,31 @@
       { key: 'bookmark', label: '书标' },
     ];
 
-    const jsonUrl = exportJsonFile(jsonFileName, productItems);
-    await sleep(300);
-    const csvUrl = exportCsvFile(csvFileName, csvRows, csvHeaders);
+    let jsonDownload = null;
+    let csvDownload = null;
+
+    if (format === EXPORT_FORMATS.JSON || format === EXPORT_FORMATS.BOTH) {
+      jsonDownload = createJsonDownload(jsonFileName, productItems);
+    }
+
+    if (format === EXPORT_FORMATS.CSV || format === EXPORT_FORMATS.BOTH) {
+      csvDownload = createCsvDownload(csvFileName, csvRows, csvHeaders);
+    }
+
+    await autoDownloadByFormat(format, jsonDownload, csvDownload);
+
+    const actionHtml = buildManualDownloadButtons(format, jsonDownload, csvDownload);
+    setOverlayActions(actionHtml);
+    attachRedownloadBothListener(jsonDownload, csvDownload);
 
     setOverlayStatus(
       `导出完成。\n` +
-      `JSON：${jsonFileName}\n` +
-      `CSV：${csvFileName}\n` +
-      `条目数：${productItems.length}`
+      `格式：${format}\n` +
+      `条目数：${productItems.length}\n` +
+      `${jsonDownload ? `JSON：${jsonFileName}\n` : ''}` +
+      `${csvDownload ? `CSV：${csvFileName}\n` : ''}` +
+      `如果没有自动下载，请点下面的按钮。`
     );
-
-    setOverlayActions(`
-      <div style="display:flex;flex-direction:column;gap:8px;">
-        <a href="${jsonUrl}" download="${jsonFileName}"
-           style="display:inline-block;background:#42bd56;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;text-align:center;">
-          如果 JSON 没自动下载，点这里
-        </a>
-        <a href="${csvUrl}" download="${csvFileName}"
-           style="display:inline-block;background:#2d8cf0;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;text-align:center;">
-          如果 CSV 没自动下载，点这里
-        </a>
-      </div>
-    `);
 
     clearState(people, isWish);
   }
@@ -834,6 +981,7 @@
     const people = getPeopleIdFromUrl();
     const isWish = isWishMode();
     const currentStart = getCurrentStart();
+    const format = getExportFormatFromUrl();
 
     if (!people) {
       alert('无法识别豆瓣用户 ID');
@@ -853,7 +1001,7 @@
     }
 
     if (state.visitedStarts.includes(currentStart)) {
-      const nextPageUrl = getNextPageUrl(state.runId);
+      const nextPageUrl = getNextPageUrl(state.runId, format);
       if (nextPageUrl) {
         setOverlayStatus(
           `检测到当前页已处理过，准备跳到下一页...\n当前 start=${currentStart}`
@@ -862,26 +1010,27 @@
         return;
       }
 
-      await exportAll(people, isWish, state);
+      await exportAll(people, isWish, state, format);
       return;
     }
 
     setOverlayStatus(
       `正在抓取列表页...\n` +
       `模式：${isWish ? '想读' : '读过'}\n` +
-      `当前 start=${currentStart}`
+      `当前 start=${currentStart}\n` +
+      `导出格式：${format}`
     );
 
     const pageItems = parseListPageItems(isWish);
 
     if (!pageItems.length) {
       console.warn('[豆瓣商品导入版] 当前页没有识别到条目');
-      const nextPageUrl = getNextPageUrl(state.runId);
+      const nextPageUrl = getNextPageUrl(state.runId, format);
       if (nextPageUrl) {
         location.href = nextPageUrl;
         return;
       }
-      await exportAll(people, isWish, state);
+      await exportAll(people, isWish, state, format);
       return;
     }
 
@@ -891,7 +1040,7 @@
     mergeItemsIntoState(state, enrichedItems);
     saveState(people, isWish, state);
 
-    const nextPageUrl = getNextPageUrl(state.runId);
+    const nextPageUrl = getNextPageUrl(state.runId, format);
     if (nextPageUrl) {
       setOverlayStatus(
         `当前页完成。\n` +
@@ -902,7 +1051,7 @@
       return;
     }
 
-    await exportAll(people, isWish, state);
+    await exportAll(people, isWish, state, format);
   }
 
   if (isHomepage() || (isBookListPage() && !isExportMode())) {
