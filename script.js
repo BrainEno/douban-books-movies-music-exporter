@@ -1,15 +1,17 @@
 // ==UserScript==
-// @name         豆瓣读书商品导入版（支持读过/想读/豆列）
+// @name         豆瓣读书商品导入版（支持读过/想读/豆列，保留完整出版年）
 // @namespace    https://chat.openai.com/
-// @version      1.2.0
-// @description  从豆瓣读过/想读/豆列中抓取图书详情，导出可用于图书管理系统导入的 ProductModel JSON 和表单对齐 CSV
+// @version      1.4.0
+// @description  从豆瓣读过/想读/豆列抓取图书详情，导出可用于图书管理系统导入的 ProductModel JSON 和表单对齐 CSV；修复豆列详情补抓并保留完整出版年文本
 // @author       OpenAI
 // @match        https://book.douban.com/people/*/collect*
 // @match        https://book.douban.com/people/*/wish*
 // @match        https://www.douban.com/people/*
 // @match        https://www.douban.com/doulist/*
 // @require      https://cdn.jsdelivr.net/gh/zh-lx/pinyin-pro@latest/dist/pinyin-pro.js
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      book.douban.com
+// @connect      www.douban.com
 // ==/UserScript==
 
 (function () {
@@ -19,6 +21,7 @@
   const STORAGE_PREFIX = 'douban_book_product_import';
   const RATE_LIMIT_MS = 900;
   const RETRY_TIMES = 2;
+  const REQUEST_TIMEOUT_MS = 20000;
   const DEFAULT_OPERATOR = 'douban-import-script';
   const DEFAULT_STOCK_UNIT = '册';
   const DEFAULT_OPTION = '不区分';
@@ -58,7 +61,10 @@
   }
 
   function isBookListPage() {
-    return location.hostname === 'book.douban.com' && /^\/people\/[^/]+\/(collect|wish)/.test(location.pathname);
+    return (
+      location.hostname === 'book.douban.com' &&
+      /^\/people\/[^/]+\/(collect|wish)/.test(location.pathname)
+    );
   }
 
   function isDoulistPage() {
@@ -101,10 +107,7 @@
   }
 
   function getSourceType() {
-    if (isDoulistPage()) {
-      return SOURCE_TYPES.DOULIST;
-    }
-    return SOURCE_TYPES.PEOPLE;
+    return isDoulistPage() ? SOURCE_TYPES.DOULIST : SOURCE_TYPES.PEOPLE;
   }
 
   function getSourceId() {
@@ -166,9 +169,7 @@
 
   function createFloatingPanel() {
     let panel = document.getElementById('douban-book-product-import-panel');
-    if (panel) {
-      return panel;
-    }
+    if (panel) return panel;
 
     panel = document.createElement('div');
     panel.id = 'douban-book-product-import-panel';
@@ -185,7 +186,7 @@
       'width:300px',
       'font-size:13px',
       'line-height:1.5',
-      'color:#333'
+      'color:#333',
     ].join(';');
 
     document.body.appendChild(panel);
@@ -201,7 +202,7 @@
       panel.innerHTML = `
         <div style="font-weight:700;margin-bottom:8px;">豆瓣读书商品导入版</div>
         <div style="color:#666;margin-bottom:10px;">
-          当前页面识别为书单 / 豆列页面。脚本会只导出其中的图书条目，并抓取 ISBN、出版社、定价等字段。
+          当前页面识别为书单 / 豆列页面。脚本会导出其中图书条目，并强制抓取详情页补齐作者、ISBN、定价、出版年等字段。
           <br><br>当前豆列 ID：${doulistId || '-'}
         </div>
 
@@ -227,19 +228,16 @@
         const format = select?.value || EXPORT_FORMATS.BOTH;
         location.href = buildDoulistExportUrl(format);
       });
-
       return;
     }
 
     const people = getPeopleIdFromUrl();
-    if (!people) {
-      return;
-    }
+    if (!people) return;
 
     panel.innerHTML = `
       <div style="font-weight:700;margin-bottom:8px;">豆瓣读书商品导入版</div>
       <div style="color:#666;margin-bottom:10px;">
-        自动抓取 ISBN、出版社、定价、装帧等字段，并导出为适合导入图书管理系统的文件
+        自动抓取 ISBN、出版社、定价、装帧、出版年等字段，并导出为适合导入图书管理系统的文件
       </div>
 
       <label style="display:block;margin-bottom:6px;font-weight:600;">导出格式</label>
@@ -279,9 +277,7 @@
 
   function ensureOverlay() {
     let overlay = document.getElementById('douban-book-product-import-overlay');
-    if (overlay) {
-      return overlay;
-    }
+    if (overlay) return overlay;
 
     overlay = document.createElement('div');
     overlay.id = 'douban-book-product-import-overlay';
@@ -290,7 +286,7 @@
       'right:20px',
       'bottom:20px',
       'z-index:1000000',
-      'width:360px',
+      'width:380px',
       'background:#fff',
       'border:1px solid #d9d9d9',
       'border-radius:12px',
@@ -298,7 +294,7 @@
       'padding:14px',
       'font-size:13px',
       'line-height:1.6',
-      'color:#333'
+      'color:#333',
     ].join(';');
 
     overlay.innerHTML = `
@@ -333,9 +329,7 @@
 
   function loadState(sourceType, sourceId, sourceMode) {
     const raw = sessionStorage.getItem(getStorageKey(sourceType, sourceId, sourceMode));
-    if (!raw) {
-      return null;
-    }
+    if (!raw) return null;
     try {
       return JSON.parse(raw);
     } catch (error) {
@@ -367,31 +361,12 @@
     };
   }
 
-  function parsePeoplePageItems(isWish) {
-    const items = [];
-    const listItems = qsa('li.item');
-
-    listItems.forEach((li) => {
-      const titleAnchor =
-        qs('.title a', li) ||
-        qs('h2 a', li) ||
-        qs('a[href*="/subject/"]', li);
-
-      if (!titleAnchor) {
-        return;
-      }
-
-      const link = new URL(titleAnchor.getAttribute('href'), location.href).href;
-      const subjectId = extractSubjectId(link);
-
-      if (!subjectId) {
-        return;
-      }
-
-      const item = {
-        title: normalizeText(titleAnchor.textContent),
-        link,
-        subject_id: subjectId,
+  function buildEmptyItem(overrides = {}) {
+    return Object.assign(
+      {
+        title: '',
+        link: '',
+        subject_id: '',
         rating: '',
         rating_date: '',
         comment: '',
@@ -412,7 +387,32 @@
         edition: '',
         fetch_status: 'pending',
         fetch_error: '',
-      };
+      },
+      overrides
+    );
+  }
+
+  function parsePeoplePageItems(isWish) {
+    const items = [];
+    const listItems = qsa('li.item');
+
+    listItems.forEach((li) => {
+      const titleAnchor =
+        qs('.title a', li) ||
+        qs('h2 a', li) ||
+        qs('a[href*="/subject/"]', li);
+
+      if (!titleAnchor) return;
+
+      const link = new URL(titleAnchor.getAttribute('href'), location.href).href;
+      const subjectId = extractSubjectId(link);
+      if (!subjectId) return;
+
+      const item = buildEmptyItem({
+        title: normalizeText(titleAnchor.textContent),
+        link,
+        subject_id: subjectId,
+      });
 
       if (!isWish) {
         const dateEl = qs('.date', li);
@@ -455,86 +455,31 @@
     return items;
   }
 
-  function findLikelyDoulistBookContainer(anchor) {
-    let node = anchor;
-    while (node && node !== document.body) {
-      if (node.matches) {
-        const isCandidate =
-          node.matches('li, .item, .doulist-item, .bd, .content, .article, .doulist-subject');
-        if (isCandidate) {
-          const bookLinks = node.querySelectorAll('a[href*="book.douban.com/subject/"]').length;
-          if (bookLinks >= 1 && bookLinks <= 4) {
-            return node;
-          }
-        }
-      }
-      node = node.parentElement;
-    }
-    return anchor.parentElement || anchor;
-  }
-
   function parseDoulistPageItems() {
     const items = [];
     const seen = new Set();
-
-    const anchors = qsa('a[href*="book.douban.com/subject/"]');
+    const anchors = qsa('a[href*="book.douban.com/subject/"], a[href*="/subject/"]');
 
     anchors.forEach((anchor) => {
       const href = anchor.getAttribute('href');
-      if (!href) {
-        return;
-      }
+      if (!href) return;
 
       const link = new URL(href, location.href).href;
-      if (!isBookSubjectUrl(link)) {
-        return;
-      }
+      if (!isBookSubjectUrl(link)) return;
 
       const subjectId = extractSubjectId(link);
-      if (!subjectId || seen.has(subjectId)) {
-        return;
-      }
+      if (!subjectId || seen.has(subjectId)) return;
 
       const rawTitle = normalizeText(anchor.textContent);
-      if (!rawTitle) {
-        return;
-      }
-
-      const container = findLikelyDoulistBookContainer(anchor);
-      const blockText = normalizeText(container.textContent);
-
-      // 简单过滤掉明显不是书目标题的锚点
-      if (blockText.length < 2) {
-        return;
-      }
-
       seen.add(subjectId);
 
-      items.push({
-        title: rawTitle,
-        link,
-        subject_id: subjectId,
-        rating: '',
-        rating_date: '',
-        comment: '',
-        release_date: '',
-        author: '',
-        publisher: '',
-        publish_year: '',
-        price: '',
-        price_value: '',
-        price_currency: '',
-        binding: '',
-        pages: '',
-        isbn: '',
-        translator: '',
-        subtitle: '',
-        original_title: '',
-        series: '',
-        edition: '',
-        fetch_status: 'pending',
-        fetch_error: '',
-      });
+      items.push(
+        buildEmptyItem({
+          title: rawTitle,
+          link,
+          subject_id: subjectId,
+        })
+      );
     });
 
     return items;
@@ -547,9 +492,7 @@
       price_currency: '',
     };
 
-    if (!priceText) {
-      return result;
-    }
+    if (!priceText) return result;
 
     const numMatch = priceText.match(/(\d+(?:\.\d+)?)/);
     result.price_value = numMatch ? numMatch[1] : '';
@@ -592,9 +535,7 @@
     const titleEl = qs('#wrapper h1 span', doc) || qs('h1 span', doc) || qs('h1', doc);
     result.title = normalizeText(titleEl?.textContent || fallbackTitle || '');
 
-    if (!infoEl) {
-      return result;
-    }
+    if (!infoEl) return result;
 
     const infoMap = {};
     let currentLabel = '';
@@ -620,9 +561,7 @@
         flush();
       } else if (currentLabel) {
         const txt = normalizeText(node.textContent || '');
-        if (txt) {
-          currentParts.push(txt);
-        }
+        if (txt) currentParts.push(txt);
       }
     });
 
@@ -633,8 +572,8 @@
     result.subtitle = infoMap['副标题'] || '';
     result.original_title = infoMap['原作名'] || '';
     result.publish_year = infoMap['出版年'] || '';
-    result.pages = infoMap['页数'] || '';
     result.binding = infoMap['装帧'] || '';
+    result.pages = infoMap['页数'] || '';
     result.isbn = infoMap['ISBN'] || '';
     result.translator = infoMap['译者'] || '';
     result.series = infoMap['丛书'] || '';
@@ -648,17 +587,48 @@
     return result;
   }
 
-  async function fetchWithRetry(url, attempt = 0) {
-    try {
-      const resp = await fetch(url, {
-        credentials: 'include',
-      });
-
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
+  function httpGetText(url) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          timeout: REQUEST_TIMEOUT_MS,
+          anonymous: false,
+          headers: {
+            Accept:
+              'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+          onload(response) {
+            if (response.status >= 200 && response.status < 400 && response.responseText) {
+              resolve(response.responseText);
+            } else {
+              reject(new Error(`HTTP ${response.status}`));
+            }
+          },
+          onerror(err) {
+            reject(err || new Error('GM_xmlhttpRequest error'));
+          },
+          ontimeout() {
+            reject(new Error('GM_xmlhttpRequest timeout'));
+          },
+        });
+        return;
       }
 
-      return await resp.text();
+      fetch(url, { credentials: 'include' })
+        .then((resp) => {
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          return resp.text();
+        })
+        .then(resolve)
+        .catch(reject);
+    });
+  }
+
+  async function fetchWithRetry(url, attempt = 0) {
+    try {
+      return await httpGetText(url);
     } catch (error) {
       if (attempt < RETRY_TIMES) {
         await sleep(RATE_LIMIT_MS * (attempt + 1));
@@ -698,8 +668,8 @@
       const current = items[i];
       setOverlayStatus(
         `正在抓取详情页...\n` +
-        `当前页进度：${i + 1}/${items.length}\n` +
-        `书名：${current.title}`
+          `当前页进度：${i + 1}/${items.length}\n` +
+          `书名：${current.title || current.subject_id}`
       );
 
       const detailItem = await enrichBookItem(current);
@@ -716,7 +686,7 @@
       '.paginator .next a',
       'span.next a',
       'a.next',
-      '.next a'
+      '.next a',
     ];
 
     for (const selector of selectors) {
@@ -739,19 +709,17 @@
 
   function getNextPageUrl(runId, format) {
     const nextHref = getRawNextPageHref();
-    if (!nextHref) {
-      return '';
-    }
+    if (!nextHref) return '';
     return buildNextPageUrl(nextHref, runId, format);
   }
 
   function mergeItemsIntoState(state, newItems) {
     const existingKeys = new Set(
-      state.items.map((item) => `${item.subject_id}__${item.rating_date}__${item.title}`)
+      state.items.map((item) => `${item.subject_id}__${item.title}`)
     );
 
     newItems.forEach((item) => {
-      const key = `${item.subject_id}__${item.rating_date}__${item.title}`;
+      const key = `${item.subject_id}__${item.title}`;
       if (!existingKeys.has(key)) {
         state.items.push(item);
         existingKeys.add(key);
@@ -799,9 +767,7 @@
 
   function buildBaseSelfEncoding(title, subjectId) {
     const text = normalizeText(title);
-    if (!text) {
-      return `book-${subjectId || 'unknown'}`;
-    }
+    if (!text) return `book-${subjectId || 'unknown'}`;
 
     let output = '';
     let buffer = '';
@@ -810,9 +776,7 @@
       if (!buffer) return;
       const normalized = normalizeAsciiSegment(buffer);
       if (normalized) {
-        if (output && !output.endsWith('-')) {
-          output += '-';
-        }
+        if (output && !output.endsWith('-')) output += '-';
         output += normalized;
       }
       buffer = '';
@@ -822,16 +786,12 @@
       if (isChineseChar(char)) {
         flushBuffer();
         const initial = safePinyinInitial(char);
-        if (initial) {
-          output += initial;
-        }
+        if (initial) output += initial;
       } else if (/[A-Za-z0-9]/.test(char)) {
         buffer += char;
       } else {
         flushBuffer();
-        if (output && !output.endsWith('-')) {
-          output += '-';
-        }
+        if (output && !output.endsWith('-')) output += '-';
       }
     }
 
@@ -842,11 +802,7 @@
       .replace(/^-|-$/g, '')
       .toLowerCase();
 
-    if (!output) {
-      return `book-${subjectId || 'unknown'}`;
-    }
-
-    return output;
+    return output || `book-${subjectId || 'unknown'}`;
   }
 
   function ensureUniqueSuffix(base, usedSet) {
@@ -860,9 +816,9 @@
     return candidate;
   }
 
-  function parsePublicationYear(raw) {
-    const match = String(raw || '').match(/(\d{4})/);
-    return match ? Number(match[1]) : null;
+  function normalizePublicationText(raw) {
+    const text = normalizeText(raw);
+    return text || null;
   }
 
   function parsePriceNumber(raw) {
@@ -904,7 +860,9 @@
       const isbn = normalizeText(item.isbn) || null;
       const subjectId = normalizeText(item.subject_id);
       const parsedPrice = parsePriceNumber(item.price_value || item.price);
-      const publicationYear = parsePublicationYear(item.publish_year || item.release_date);
+      const publicationYear = normalizePublicationText(
+        item.publish_year || item.release_date
+      );
 
       let productIdBase = isbn || `DB-${subjectId || 'UNKNOWN'}`;
       productIdBase = normalizeText(productIdBase);
@@ -927,7 +885,7 @@
         selfEncoding,
         internalPricing: null,
         purchasePrice: parsedPrice || null,
-        publicationYear,
+        publicationYear, // 保留豆瓣原始文本，如 2026-02 / 2026-02-01
         edition: normalizeText(item.edition) || null,
         binding: normalizeText(item.binding) || DEFAULT_OPTION,
         retailDiscount: null,
@@ -980,7 +938,6 @@
   function createCsvDownload(fileName, rows, headers) {
     const utf8Bom = '\uFEFF';
     let csv = '';
-
     csv += headers.map((h) => h.label).join(',') + '\r\n';
 
     rows.forEach((row) => {
@@ -1077,18 +1034,12 @@
       `);
     }
 
-    return `
-      <div style="display:flex;flex-direction:column;gap:8px;">
-        ${parts.join('')}
-      </div>
-    `;
+    return `<div style="display:flex;flex-direction:column;gap:8px;">${parts.join('')}</div>`;
   }
 
   function attachRedownloadBothListener(jsonDownload, csvDownload) {
     const btn = qs('#douban-redownload-both-btn');
-    if (!btn) {
-      return;
-    }
+    if (!btn) return;
 
     btn.addEventListener('click', async () => {
       if (csvDownload) {
@@ -1116,9 +1067,9 @@
 
     setOverlayStatus(
       `准备导出...\n` +
-      `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
-      `总条目数：${productItems.length}\n` +
-      `导出格式：${format}`
+        `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
+        `总条目数：${productItems.length}\n` +
+        `导出格式：${format}`
     );
 
     if (!productItems.length) {
@@ -1175,12 +1126,12 @@
 
     setOverlayStatus(
       `导出完成。\n` +
-      `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
-      `格式：${format}\n` +
-      `条目数：${productItems.length}\n` +
-      `${jsonDownload ? `JSON：${jsonFileName}\n` : ''}` +
-      `${csvDownload ? `CSV：${csvFileName}\n` : ''}` +
-      `如果没有自动下载，请点下面的按钮。`
+        `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
+        `格式：${format}\n` +
+        `条目数：${productItems.length}\n` +
+        `${jsonDownload ? `JSON：${jsonFileName}\n` : ''}` +
+        `${csvDownload ? `CSV：${csvFileName}\n` : ''}` +
+        `如果没有自动下载，请点下面的按钮。`
     );
 
     clearState(sourceType, sourceId, sourceMode);
@@ -1226,9 +1177,9 @@
 
     setOverlayStatus(
       `正在抓取列表页...\n` +
-      `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
-      `当前 start=${currentStart}\n` +
-      `导出格式：${format}`
+        `来源：${sourceType === SOURCE_TYPES.DOULIST ? `豆列 ${sourceId}` : sourceMode}\n` +
+        `当前 start=${currentStart}\n` +
+        `导出格式：${format}`
     );
 
     const pageItems =
@@ -1257,8 +1208,8 @@
     if (nextPageUrl) {
       setOverlayStatus(
         `当前页完成。\n` +
-        `已累计条目：${state.items.length}\n` +
-        `准备跳转下一页...`
+          `已累计条目：${state.items.length}\n` +
+          `准备跳转下一页...`
       );
       location.href = nextPageUrl;
       return;
@@ -1267,11 +1218,7 @@
     await exportAll(sourceType, sourceId, sourceMode, state, format);
   }
 
-  if (
-    isHomepage() ||
-    isDoulistPage() ||
-    (isBookListPage() && !isExportMode())
-  ) {
+  if (isHomepage() || isDoulistPage() || (isBookListPage() && !isExportMode())) {
     injectLauncherPanel();
   }
 
