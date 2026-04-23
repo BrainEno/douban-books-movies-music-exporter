@@ -350,80 +350,100 @@
   }
 
   function parseCurrentPageItems(media, mode) {
-    const statusText =
-      mode === 'collect' ? MEDIA[media].statusCollect : MEDIA[media].statusWish;
-    const items = [];
+  const statusText =
+    mode === 'collect' ? MEDIA[media].statusCollect : MEDIA[media].statusWish;
 
-    // 关键修复：不要只匹配 li.item
-    const listItems = qsa('.grid-view .item, .article .item, .item');
+  const items = [];
+  const seen = new Set();
 
-    listItems.forEach((node) => {
-      const titleAnchor =
-        qs('.title a', node) ||
-        qs('li.title a', node) ||
-        qs('em a', node) ||
-        qs('a[href*="/subject/"]', node);
+  // 先直接抓 subject 链接，而不是先假设外层 item 结构一定长什么样
+  const anchors = qsa('a[href*="/subject/"]');
 
-      if (!titleAnchor) return;
+  anchors.forEach((anchor) => {
+    const href = anchor.getAttribute('href');
+    if (!href || !/subject\/\d+/.test(href)) return;
 
-      const href = titleAnchor.getAttribute('href');
-      if (!href || !/subject\/\d+/.test(href)) return;
+    const link = new URL(href, location.href).href;
+    const subjectId = extractSubjectId(link);
+    if (!subjectId || seen.has(subjectId)) return;
 
-      const link = new URL(href, location.href).href;
-      const subjectId = extractSubjectId(link);
-      if (!subjectId) return;
+    // 只接受三大站点各自的 subject 页面
+    if (
+      (media === 'book' && !/book\.douban\.com\/subject\//.test(link)) ||
+      (media === 'movie' && !/movie\.douban\.com\/subject\//.test(link)) ||
+      (media === 'music' && !/music\.douban\.com\/subject\//.test(link))
+    ) {
+      return;
+    }
 
-      const title = normalizeText(titleAnchor.textContent);
-      if (!title) return;
+    const title = normalizeText(anchor.textContent);
+    if (!title) return;
 
-      const item = buildEmptyItem(media, mode, statusText, {
-        title,
-        link,
-        subjectId,
-        cover:
-          qs('.pic img', node)?.getAttribute('src') ||
-          qs('img', node)?.getAttribute('src') ||
-          '',
-      });
-
-      const dateEl = qs('.date', node);
-      if (dateEl) {
-        const dateClone = dateEl.cloneNode(true);
-        const ratingSpan = qs('span', dateClone);
-        if (ratingSpan) {
-          const className = ratingSpan.getAttribute('class') || '';
-          const ratingMatch = className.match(/rating(\d)-t/);
-          item.myRating = ratingMatch ? ratingMatch[1] : '';
-          ratingSpan.remove();
-        }
-        item.markedAt = normalizeText(dateClone.textContent).replaceAll('-', '/');
+    // 往上找最可能的条目容器
+    let container = anchor;
+    while (container && container !== document.body) {
+      if (
+        container.matches &&
+        (
+          container.matches('.item') ||
+          container.matches('li') ||
+          container.matches('.grid-view > div') ||
+          container.matches('.article > div') ||
+          container.matches('.subject-item')
+        )
+      ) {
+        break;
       }
+      container = container.parentElement;
+    }
 
-      const commentEl = qs('.comment', node);
-      if (commentEl) {
-        item.comment = normalizeText(commentEl.textContent);
-      }
+    const node = container || anchor;
 
-      const introEl = qs('.intro', node);
-      if (introEl) {
-        item.intro = normalizeText(introEl.textContent);
-      }
-
-      items.push(item);
+    const item = buildEmptyItem(media, mode, statusText, {
+      title,
+      link,
+      subjectId,
+      cover:
+        qs('.pic img', node)?.getAttribute('src') ||
+        qs('img', node)?.getAttribute('src') ||
+        '',
     });
 
-    // 去重
-    const deduped = [];
-    const seen = new Set();
-    for (const item of items) {
-      if (!seen.has(item.subjectId)) {
-        seen.add(item.subjectId);
-        deduped.push(item);
+    const dateEl = qs('.date', node);
+    if (dateEl) {
+      const dateClone = dateEl.cloneNode(true);
+      const ratingSpan = qs('span', dateClone);
+      if (ratingSpan) {
+        const className = ratingSpan.getAttribute('class') || '';
+        const ratingMatch = className.match(/rating(\d)-t/);
+        item.myRating = ratingMatch ? ratingMatch[1] : '';
+        ratingSpan.remove();
+      }
+      item.markedAt = normalizeText(dateClone.textContent).replaceAll('-', '/');
+    }
+
+    const commentEl = qs('.comment', node);
+    if (commentEl) {
+      item.comment = normalizeText(commentEl.textContent);
+    }
+
+    const introEl = qs('.intro', node);
+    if (introEl) {
+      item.intro = normalizeText(introEl.textContent);
+    } else {
+      // 某些页面没有 .intro，就尝试从容器文本里兜底拿一段
+      const containerText = normalizeText(node.textContent || '');
+      if (containerText) {
+        item.intro = containerText;
       }
     }
 
-    return deduped;
-  }
+    seen.add(subjectId);
+    items.push(item);
+  });
+
+  return items;
+}
 
   function httpGetText(url) {
     return new Promise((resolve, reject) => {
